@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  ffmpegLambdaVersion:
+    Type: String
+    Default: 1.0.0
+    Description: The semantic version of the ffmpeg layer you wish to deploy.
+  LambdaFunctionName:
+    Type: String
+  SqsName:
+    Type: String
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref SqsName
+      MessageRetentionPeriod: 1500
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 1500
+  QueuePolicy:
+    DependsOn: Queue
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: AllowBucketToPushNotification
+          Effect: Allow
+          Principal:
+            AWS: "*"
+          Action: sqs:SendMessage
+          Resource: "*"
+      Queues:
+        - !Ref Queue
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Below is needed for the lambda to log successfully to cloudwatch
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: allowSqs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ChangeMessageVisibility
+              Resource: !GetAtt Queue.Arn
+        - PolicyName: allowLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - s3:GetObject
+              - s3:PutObject
+              Resource: arn:aws:s3:::*
+
+  
+  SubscribeLogStreamsToFirehoseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: !Ref LambdaFunctionName
+      Layers:
+        - !GetAtt ffmpeglambdalayer.Outputs.LayerVersion
+      Code:
+        ZipFile: |
+          import sys
+          import os
+          sys.path.append(os.path.abspath('./packages'))
+          import boto3
+          from urllib.parse import urlparse
+          import subprocess
+          def handle_ffmpeg(path):
+              subprocess.call(['/opt/bin/ffmpeg', '-i', path, '-f', 'framemd5', '/tmp/{}-processed.framemd5'.format(path.split('/')[-1].split('.')[0])])
+          def setup_ffmpeg():
+              subprocess.call(['chmod', '755', '/opt/bin/ffmpeg'])
+          def lambda_handler(request, context):
+              setup_ffmpeg()
+              uploaded = 0
+              s3 = boto3.client('s3')
+              for i, message in enumerate(request['Records']):
+                  print('message: ', message)
+                  with open('/tmp/file_{}.mp4'.format(i), 'wb+') as f:
+                      parsed_url = urlparse(message['body'])
+                      bucket_name = parsed_url.netloc.split('.')[0]
+                      path = parsed_url.path.lstrip('/')
+                      s3.download_fileobj(bucket_name, path, f)
+                  handle_ffmpeg('/tmp/file_{}.mp4'.format(i))
+                  uploaded += 1
+                  try:
+                      s3.upload_file('/tmp/file_{}-processed.framemd5'.format(i), bucket_name, path + '.framemd5')
+                      print('uploaded file')
+                  except Exception as e:
+                      print('Exception: ', e)
+                      uploaded -= 1
+              return {
+                  "status": "success",
+                  "message": "uploaded {} out of {} messages".format(uploaded, len(request['Records']))
+              }
+      Runtime: "python3.6"
+      Timeout: 300
+
+  LambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !GetAtt SubscribeLogStreamsToFirehoseLambda.Arn
+  PermissionForEventsToInvokeLambda:
+    DependsOn: SubscribeLogStreamsToFirehoseLambda
+    DependsOn: Queue
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref "SubscribeLogStreamsToFirehoseLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "sqs.amazonaws.com"
+      SourceArn: !GetAtt Queue.Arn
+
+  ffmpeglambdalayer:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: arn:aws:serverlessrepo:us-east-1:145266761615:applications/ffmpeg-lambda-layer
+        SemanticVersion: !Ref ffmpegLambdaVersion
+    
+Transform: AWS::Serverless-2016-10-31
